@@ -48,8 +48,26 @@ def is_common_stock(code: str, name: str) -> bool:
     return True
 
 
+# ⭐ 시가총액 → 억원 단위 변환
+def to_eok(value):
+    try:
+        v = float(value)
+    except:
+        return 0.0
+    return v / 100_000_000
+
+
+# ⭐ 거래대금 → 천원 단위 변환
+def to_thousand(value):
+    try:
+        v = float(value)
+    except:
+        return 0.0
+    return v / 1000
+
+
 ########################################################
-# Naver HTML 크롤링 목표가
+# Naver 목표가 크롤링
 ########################################################
 def get_naver_target_price_html(code: str) -> float:
     url = f"https://finance.naver.com/item/main.naver?code={code}"
@@ -78,28 +96,6 @@ def get_naver_target_price_html(code: str) -> float:
                 if len(em_tags) >= 2:
                     return safe_float(em_tags[-1].text)
 
-        th = soup.find("th", string="목표주가")
-        if th:
-            td = th.find_next_sibling("td")
-            if td:
-                em_tag = td.find("em")
-                if em_tag and em_tag.text.strip():
-                    return safe_float(em_tag.text)
-                span_blind = td.find("span", class_="blind")
-                if span_blind and span_blind.text.strip():
-                    return safe_float(span_blind.text)
-
-        dt = soup.find("dt", string="목표주가")
-        if dt:
-            dd = dt.find_next_sibling("dd")
-            if dd:
-                em_tag = dd.find("em")
-                if em_tag and em_tag.text.strip():
-                    return safe_float(em_tag.text)
-                span_blind = dd.find("span", class_="blind")
-                if span_blind and span_blind.text.strip():
-                    return safe_float(span_blind.text)
-
         return 0.0
 
     except Exception:
@@ -107,7 +103,7 @@ def get_naver_target_price_html(code: str) -> float:
 
 
 ########################################################
-# Data Manager (V2 확장)
+# Data Manager
 ########################################################
 class AnalysisManager:
     def __init__(self):
@@ -127,14 +123,11 @@ class AnalysisManager:
                 code = future_to_code[future]
                 try:
                     target = future.result()
-                except Exception as e:
-                    logger.warning(f"[{code}] 목표가 수집 실패: {e}")
+                except Exception:
                     target = 0.0
                 self.target_cache[code] = target
-                if i % 100 == 0 or i == len(codes):
-                    logger.info(f"네이버 목표가 수집 진행률: {i}/{len(codes)}")
 
-        logger.info("네이버 목표가 멀티스레드 수집 완료")
+        logger.info("네이버 목표가 수집 완료")
 
     def update(self, code, name, market, current, target_price,
                prev_close, volume, amount, shares, market_cap):
@@ -168,7 +161,7 @@ class AnalysisManager:
 
 
 ########################################################
-# QThread: 네이버 목표가 수집 스레드
+# Naver Thread
 ########################################################
 class NaverTargetThread(QThread):
     finished = pyqtSignal()
@@ -179,15 +172,15 @@ class NaverTargetThread(QThread):
         self.codes = codes
 
     def run(self):
-        self.manager.preload_targets(self.codes, max_workers=10)
+        self.manager.preload_targets(self.codes)
         self.finished.emit()
 
 
 ########################################################
-# Kiwoom Wrapper (V2 확장)
+# Kiwoom API Wrapper
 ########################################################
 class Kiwoom(QAxWidget):
-    TR_INTERVAL = 250  # ms
+    TR_INTERVAL = 250
 
     def __init__(self, manager: AnalysisManager, gui):
         super().__init__()
@@ -230,7 +223,6 @@ class Kiwoom(QAxWidget):
 
         self.codes = filtered
         self.tr_total = len(self.codes)
-        logger.info(f"필터링 후 종목 수: {self.tr_total}")
 
         self.gui.label_status.setText("네이버 목표가 수집 중...")
         self.naver_thread = NaverTargetThread(self.manager, self.codes)
@@ -238,7 +230,6 @@ class Kiwoom(QAxWidget):
         self.naver_thread.start()
 
     def _on_naver_done(self):
-        logger.info("네이버 목표가 수집 완료. Kiwoom TR 시작.")
         self.gui.label_status.setText("Kiwoom TR 수집 시작...")
 
         for code in self.codes:
@@ -249,7 +240,6 @@ class Kiwoom(QAxWidget):
     def process_tr_queue(self):
         if self.is_tr_running or not self.queue:
             if not self.queue:
-                logger.info("모든 종목 처리 완료")
                 self.gui.update_table()
             return
 
@@ -280,7 +270,7 @@ class Kiwoom(QAxWidget):
 
             prev_close = abs(safe_float(self.dynamicCall(
                 "GetCommData(QString, QString, int, QString)",
-                trcode, rqname, 0, "전일종가"
+                trcode, rqname, 0, "전일가"
             )))
 
             volume = safe_float(self.dynamicCall(
@@ -295,7 +285,7 @@ class Kiwoom(QAxWidget):
 
             shares = safe_float(self.dynamicCall(
                 "GetCommData(QString, QString, int, QString)",
-                trcode, rqname, 0, "상장주식수"
+                trcode, rqname, 0, "상장주식"
             ))
 
             market_cap = safe_float(self.dynamicCall(
@@ -304,7 +294,6 @@ class Kiwoom(QAxWidget):
             ))
 
             market = self.market_map.get(code, "UNKNOWN")
-
             target_price = self.manager.target_cache.get(code, 0.0)
 
             self.manager.update(
@@ -320,7 +309,7 @@ class Kiwoom(QAxWidget):
 
 
 ########################################################
-# GUI (V2 확장)
+# GUI
 ########################################################
 class TargetPriceRankerGUI(QWidget):
     def __init__(self):
@@ -332,7 +321,7 @@ class TargetPriceRankerGUI(QWidget):
         QTimer.singleShot(500, self.init_kiwoom)
 
     def init_ui(self):
-        self.setWindowTitle("목표가 Upside 랭킹 V2 (Kiwoom + Naver HTML)")
+        self.setWindowTitle("목표가 Upside 랭킹 V2 (시가총액 억원 / 거래대금 천원)")
         self.resize(1300, 800)
 
         layout = QVBoxLayout()
@@ -348,8 +337,8 @@ class TargetPriceRankerGUI(QWidget):
         self.table.setHorizontalHeaderLabels([
             "순위", "시장", "종목코드", "종목명",
             "현재가", "목표가", "상승여력(%)",
-            "전일종가", "거래량", "거래대금",
-            "상장주식수", "시가총액"
+            "전일종가", "거래량", "거래대금(천원)",
+            "상장주식수", "시가총액(억원)"
         ])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         layout.addWidget(self.table)
@@ -378,7 +367,7 @@ class TargetPriceRankerGUI(QWidget):
         ranked_list = kospi_list + kosdaq_list
 
         if not ranked_list:
-            self.label_status.setText("조회 완료: 목표가 데이터가 있는 종목이 없습니다.")
+            self.label_status.setText("조회 완료: 목표가 데이터 없음")
             return
 
         self.table.setRowCount(len(ranked_list))
@@ -400,11 +389,18 @@ class TargetPriceRankerGUI(QWidget):
 
             self.table.setItem(i, 7, QTableWidgetItem(f"{int(data['prev_close']):,}"))
             self.table.setItem(i, 8, QTableWidgetItem(f"{int(data['volume']):,}"))
-            self.table.setItem(i, 9, QTableWidgetItem(f"{int(data['amount']):,}"))
-            self.table.setItem(i, 10, QTableWidgetItem(f"{int(data['shares']):,}"))
-            self.table.setItem(i, 11, QTableWidgetItem(f"{int(data['market_cap']):,}"))
 
-        self.label_status.setText(f"조회 완료: {len(ranked_list)} 종목 (목표가 존재)")
+            # ⭐ 거래대금 → 천원 단위
+            amount_thousand = to_thousand(data['amount'])
+            self.table.setItem(i, 9, QTableWidgetItem(f"{amount_thousand:,.2f}"))
+
+            self.table.setItem(i, 10, QTableWidgetItem(f"{int(data['shares']):,}"))
+
+            # ⭐ 시가총액 → 억원 단위
+            market_cap_eok = to_eok(data['market_cap'])
+            self.table.setItem(i, 11, QTableWidgetItem(f"{market_cap_eok:,.2f}"))
+
+        self.label_status.setText(f"조회 완료: {len(ranked_list)} 종목")
         self.save_to_csv(ranked_list)
         QMessageBox.information(self, "완료", f"조사 완료! '{self.filename}'로 저장되었습니다.")
 
@@ -416,8 +412,8 @@ class TargetPriceRankerGUI(QWidget):
             writer.writerow([
                 "순위", "시장", "종목코드", "종목명",
                 "현재가", "목표가", "상승여력(%)",
-                "전일종가", "거래량", "거래대금",
-                "상장주식수", "시가총액"
+                "전일종가", "거래량", "거래대금(천원)",
+                "상장주식수", "시가총액(억원)"
             ])
             for i, data in enumerate(ranked_list):
                 writer.writerow([
@@ -430,9 +426,9 @@ class TargetPriceRankerGUI(QWidget):
                     f"{data['upside']:.2f}%",
                     data['prev_close'],
                     data['volume'],
-                    data['amount'],
+                    f"{to_thousand(data['amount']):.2f}",
                     data['shares'],
-                    data['market_cap']
+                    f"{to_eok(data['market_cap']):.2f}"
                 ])
 
 
