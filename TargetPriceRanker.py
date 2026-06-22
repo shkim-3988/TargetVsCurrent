@@ -6,7 +6,6 @@ from typing import Dict, Any, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
-
 import requests
 from bs4 import BeautifulSoup
 
@@ -47,6 +46,24 @@ def is_common_stock(code: str, name: str) -> bool:
     if any(w in upper for w in etf_words):
         return False
     return True
+
+
+# 시가총액 → 억원 단위 변환
+def to_eok(value):
+    try:
+        v = float(value)
+    except:
+        return 0.0
+    return v / 100_000_000
+
+
+# 거래대금 → 천원 단위 변환
+def to_thousand(value):
+    try:
+        v = float(value)
+    except:
+        return 0.0
+    return v / 1000
 
 
 ########################################################
@@ -113,7 +130,8 @@ def get_naver_target_price_html(code: str) -> float:
 
         return 0.0
 
-    except Exception:
+    except Exception as e:
+        logger.warning(f"[{code}] 네이버 목표가 크롤링 실패: {e}")
         return 0.0
 
 
@@ -134,6 +152,7 @@ class AnalysisManager:
                 executor.submit(get_naver_target_price_html, code): code
                 for code in codes
             }
+            total = len(codes)
             for i, future in enumerate(as_completed(future_to_code), start=1):
                 code = future_to_code[future]
                 try:
@@ -142,12 +161,15 @@ class AnalysisManager:
                     logger.warning(f"[{code}] 목표가 수집 실패: {e}")
                     target = 0.0
                 self.target_cache[code] = target
-                if i % 100 == 0 or i == len(codes):
-                    logger.info(f"네이버 목표가 수집 진행률: {i}/{len(codes)}")
+
+                if i % 100 == 0 or i == total:
+                    logger.info(f"네이버 목표가 수집 진행률: {i}/{total}")
 
         logger.info("네이버 목표가 멀티스레드 수집 완료")
 
-    def update(self, code, name, market, current, target_price: float):
+    def update(self, code, name, market, current, target_price,
+               prev_close, volume, amount, shares, market_cap):
+
         upside = 0.0
         if current > 0 and target_price > 0:
             upside = (target_price - current) / current * 100
@@ -157,7 +179,12 @@ class AnalysisManager:
             "market": market,
             "current": current,
             "target": target_price,
-            "upside": upside
+            "upside": upside,
+            "prev_close": prev_close,
+            "volume": volume,
+            "amount": amount,
+            "shares": shares,
+            "market_cap": market_cap
         }
 
         if target_price > 0:
@@ -188,10 +215,10 @@ class NaverTargetThread(QThread):
 
 
 ########################################################
-# Kiwoom Wrapper
+# Kiwoom Wrapper (opt10007 + opt10001, B 방식 시총 계산)
 ########################################################
 class Kiwoom(QAxWidget):
-    TR_INTERVAL = 250  # ms
+    TR_INTERVAL = 700  # ms
 
     def __init__(self, manager: AnalysisManager, gui):
         super().__init__()
@@ -206,6 +233,9 @@ class Kiwoom(QAxWidget):
         self.is_tr_running = False
         self.tr_total = 0
         self.tr_count = 0
+
+        # opt10007에서 받은 전일 데이터 임시 저장용
+        self.temp_prev_data: Dict[str, Any] = {}
 
         self.naver_thread: NaverTargetThread | None = None
 
@@ -236,7 +266,6 @@ class Kiwoom(QAxWidget):
         self.tr_total = len(self.codes)
         logger.info(f"필터링 후 종목 수: {self.tr_total}")
 
-        # 네이버 목표가를 QThread에서 멀티스레드로 먼저 수집
         self.gui.label_status.setText("네이버 목표가 수집 중...")
         self.naver_thread = NaverTargetThread(self.manager, self.codes)
         self.naver_thread.finished.connect(self._on_naver_done)
@@ -261,11 +290,60 @@ class Kiwoom(QAxWidget):
         code = self.queue.popleft()
         self.is_tr_running = True
 
+        # 1단계: opt10007 먼저 요청 (전일 데이터 + 상장주식수)
         self.dynamicCall("SetInputValue(QString, QString)", "종목코드", code)
         self.dynamicCall("CommRqData(QString, QString, int, QString)",
-                         "현재가요청", "opt10001", 0, "9001")
+                         "기본정보요청", "opt10007", 0, "8001")
 
     def _on_receive_tr_data(self, screen_no, rqname, trcode, recordname, prev_next, *args):
+
+        # 1) opt10007 처리 (전일 데이터)
+        if rqname == "기본정보요청":
+            raw_code = self.dynamicCall(
+                "GetCommData(QString, QString, int, QString)",
+                trcode, rqname, 0, "종목코드"
+            ).strip()
+            code = raw_code[-6:]
+
+            prev_close = safe_float(self.dynamicCall(
+                "GetCommData(QString, QString, int, QString)",
+                trcode, rqname, 0, "전일종가"
+            ))
+
+            prev_volume = safe_float(self.dynamicCall(
+                "GetCommData(QString, QString, int, QString)",
+                trcode, rqname, 0, "전일거래량"
+            ))
+
+            prev_amount = safe_float(self.dynamicCall(
+                "GetCommData(QString, QString, int, QString)",
+                trcode, rqname, 0, "전일거래대금"
+            ))
+
+            shares_thousand = safe_float(self.dynamicCall(
+                "GetCommData(QString, QString, int, QString)",
+                trcode, rqname, 0, "상장주식수"
+            ))
+
+            shares = shares_thousand * 1000  # 천주 → 주
+            market_cap = prev_close * shares  # B 방식: 시가총액 직접 계산
+
+            self.temp_prev_data = {
+                "code": code,
+                "prev_close": prev_close,
+                "prev_volume": prev_volume,
+                "prev_amount": prev_amount,
+                "shares": shares,
+                "market_cap": market_cap
+            }
+
+            # 다음 단계: opt10001 요청 (당일 데이터)
+            self.dynamicCall("SetInputValue(QString, QString)", "종목코드", code)
+            self.dynamicCall("CommRqData(QString, QString, int, QString)",
+                             "현재가요청", "opt10001", 0, "9001")
+            return
+
+        # 2) opt10001 처리 (당일 데이터)
         if rqname == "현재가요청":
             raw_code = self.dynamicCall(
                 "GetCommData(QString, QString, int, QString)",
@@ -283,12 +361,33 @@ class Kiwoom(QAxWidget):
                 trcode, rqname, 0, "현재가"
             )))
 
-            market = self.market_map.get(code, "UNKNOWN")
+            volume = safe_float(self.dynamicCall(
+                "GetCommData(QString, QString, int, QString)",
+                trcode, rqname, 0, "거래량"
+            ))
 
-            # 네이버 목표가는 미리 수집해 둔 캐시에서 읽기
+            amount = abs(safe_float(self.dynamicCall(
+                "GetCommData(QString, QString, int, QString)",
+                trcode, rqname, 0, "거래대금"
+            )))
+
+            market = self.market_map.get(code, "UNKNOWN")
             target_price = self.manager.target_cache.get(code, 0.0)
 
-            self.manager.update(code, name, market, current, target_price)
+            prev = self.temp_prev_data
+
+            self.manager.update(
+                code,
+                name,
+                market,
+                current,
+                target_price,
+                prev["prev_close"],
+                volume,
+                amount,
+                prev["shares"],
+                prev["market_cap"]
+            )
 
             self.tr_count += 1
             self.gui.update_progress(self.tr_count, self.tr_total, self.manager.valid_count)
@@ -310,8 +409,8 @@ class TargetPriceRankerGUI(QWidget):
         QTimer.singleShot(500, self.init_kiwoom)
 
     def init_ui(self):
-        self.setWindowTitle("코스피/코스닥 목표가 Upside 랭킹 (Kiwoom + Naver HTML, 멀티스레드 A안)")
-        self.resize(1000, 700)
+        self.setWindowTitle("목표가 Upside 랭킹 V2 (시가총액 억원 / 거래대금 천원)")
+        self.resize(1300, 800)
 
         layout = QVBoxLayout()
 
@@ -322,10 +421,13 @@ class TargetPriceRankerGUI(QWidget):
         layout.addWidget(self.progress)
 
         self.table = QTableWidget()
-        self.table.setColumnCount(7)
-        self.table.setHorizontalHeaderLabels(
-            ["순위", "시장", "종목코드", "종목명", "현재가", "목표가", "상승여력(%)"]
-        )
+        self.table.setColumnCount(12)
+        self.table.setHorizontalHeaderLabels([
+            "순위", "시장", "종목코드", "종목명",
+            "현재가", "목표가", "상승여력(%)",
+            "전일종가", "거래량", "거래대금(천원)",
+            "상장주식수", "시가총액(억원)"
+        ])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         layout.addWidget(self.table)
 
@@ -344,20 +446,16 @@ class TargetPriceRankerGUI(QWidget):
     def update_table(self):
         ranked_list = self.manager.get_ranked_list()
 
-        # KOSPI와 KOSDAQ 분리
         kospi_list = [item for item in ranked_list if item["market"] == "KOSPI"]
         kosdaq_list = [item for item in ranked_list if item["market"] == "KOSDAQ"]
 
-        # 각 시장 내부에서 상승여력 내림차순 정렬
         kospi_list.sort(key=lambda x: x["upside"], reverse=True)
         kosdaq_list.sort(key=lambda x: x["upside"], reverse=True)
 
-        # 최종 리스트: KOSPI 먼저, 그 다음 KOSDAQ
         ranked_list = kospi_list + kosdaq_list
 
-
         if not ranked_list:
-            self.label_status.setText("조회 완료: 목표가 데이터가 있는 종목이 없습니다.")
+            self.label_status.setText("조회 완료: 목표가 데이터 없음")
             return
 
         self.table.setRowCount(len(ranked_list))
@@ -377,16 +475,32 @@ class TargetPriceRankerGUI(QWidget):
                 up_item.setForeground(Qt.blue)
             self.table.setItem(i, 6, up_item)
 
-        self.label_status.setText(f"조회 완료: {len(ranked_list)} 종목 (목표가 존재)")
+            self.table.setItem(i, 7, QTableWidgetItem(f"{int(data['prev_close']):,}"))
+            self.table.setItem(i, 8, QTableWidgetItem(f"{int(data['volume']):,}"))
+
+            amount_thousand = to_thousand(data['amount'])
+            self.table.setItem(i, 9, QTableWidgetItem(f"{amount_thousand:,.2f}"))
+
+            self.table.setItem(i, 10, QTableWidgetItem(f"{int(data['shares']):,}"))
+
+            market_cap_eok = to_eok(data['market_cap'])
+            self.table.setItem(i, 11, QTableWidgetItem(f"{market_cap_eok:,.2f}"))
+
+        self.label_status.setText(f"조회 완료: {len(ranked_list)} 종목")
         self.save_to_csv(ranked_list)
         QMessageBox.information(self, "완료", f"조사 완료! '{self.filename}'로 저장되었습니다.")
 
     def save_to_csv(self, ranked_list):
-        today = datetime.now().strftime("%Y%m%d")    # yymmdd 형식의 날짜 문자열 생성
-        self.filename = f"목표가_vs_현재가_{today}.csv"
+        today = datetime.now().strftime("%Y%m%d")
+        self.filename = f"목표가_vs_현재가_V2_{today}.csv"
         with open(self.filename, "w", encoding="utf-8-sig", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["순위", "시장", "종목코드", "종목명", "현재가", "목표가", "상승여력(%)"])
+            writer.writerow([
+                "순위", "시장", "종목코드", "종목명",
+                "현재가", "목표가", "상승여력(%)",
+                "전일종가", "거래량", "거래대금(천원)",
+                "상장주식수", "시가총액(억원)"
+            ])
             for i, data in enumerate(ranked_list):
                 writer.writerow([
                     i + 1,
@@ -395,7 +509,12 @@ class TargetPriceRankerGUI(QWidget):
                     data['name'],
                     data['current'],
                     data['target'],
-                    f"{data['upside']:.2f}%"
+                    f"{data['upside']:.2f}%",
+                    data['prev_close'],
+                    data['volume'],
+                    f"{to_thousand(data['amount']):.2f}",
+                    data['shares'],
+                    f"{to_eok(data['market_cap']):.2f}"
                 ])
 
 

@@ -119,6 +119,7 @@ class AnalysisManager:
                 executor.submit(get_naver_target_price_html, code): code
                 for code in codes
             }
+            total = len(codes)
             for i, future in enumerate(as_completed(future_to_code), start=1):
                 code = future_to_code[future]
                 try:
@@ -126,6 +127,9 @@ class AnalysisManager:
                 except Exception:
                     target = 0.0
                 self.target_cache[code] = target
+
+                if i % 100 == 0 or i == total:
+                    logger.info(f"네이버 목표가 수집 진행률: {i}/{total}")
 
         logger.info("네이버 목표가 수집 완료")
 
@@ -180,7 +184,7 @@ class NaverTargetThread(QThread):
 # Kiwoom API Wrapper
 ########################################################
 class Kiwoom(QAxWidget):
-    TR_INTERVAL = 250
+    TR_INTERVAL = 500  # ms (Kiwoom TR 간격, 너무 빠르면 오류 발생 가능성 있음)
 
     def __init__(self, manager: AnalysisManager, gui):
         super().__init__()
@@ -195,6 +199,9 @@ class Kiwoom(QAxWidget):
         self.is_tr_running = False
         self.tr_total = 0
         self.tr_count = 0
+
+        # opt10007에서 받은 전일 데이터 임시 저장용
+        self.temp_prev_data: Dict[str, Any] = {}
 
         self.naver_thread: NaverTargetThread | None = None
 
@@ -246,11 +253,67 @@ class Kiwoom(QAxWidget):
         code = self.queue.popleft()
         self.is_tr_running = True
 
+        # ⭐ 1단계: opt10007 먼저 요청 (전일 데이터 + 상장주식수)
         self.dynamicCall("SetInputValue(QString, QString)", "종목코드", code)
         self.dynamicCall("CommRqData(QString, QString, int, QString)",
-                         "현재가요청", "opt10001", 0, "9001")
+                         "기본정보요청", "opt10007", 0, "8001")
 
     def _on_receive_tr_data(self, screen_no, rqname, trcode, recordname, prev_next, *args):
+
+        # ==========================================
+        # 1) opt10007 처리 (전일 데이터)
+        # ==========================================
+        if rqname == "기본정보요청":
+            raw_code = self.dynamicCall(
+                "GetCommData(QString, QString, int, QString)",
+                trcode, rqname, 0, "종목코드"
+            ).strip()
+            code = raw_code[-6:]
+
+            prev_close = safe_float(self.dynamicCall(
+                "GetCommData(QString, QString, int, QString)",
+                trcode, rqname, 0, "전일종가"
+            ))
+
+            prev_volume = safe_float(self.dynamicCall(
+                "GetCommData(QString, QString, int, QString)",
+                trcode, rqname, 0, "전일거래량"
+            ))
+
+            prev_amount = safe_float(self.dynamicCall(
+                "GetCommData(QString, QString, int, QString)",
+                trcode, rqname, 0, "전일거래대금"
+            ))
+
+            shares_thousand = safe_float(self.dynamicCall(
+                "GetCommData(QString, QString, int, QString)",
+                trcode, rqname, 0, "상장주식수"
+            ))
+
+            # 천주 → 주
+            shares = shares_thousand * 1000
+
+            # ⭐ B 방식: 시가총액 직접 계산
+            market_cap = prev_close * shares
+
+            self.temp_prev_data = {
+                "code": code,
+                "prev_close": prev_close,
+                "prev_volume": prev_volume,
+                "prev_amount": prev_amount,
+                "shares": shares,
+                "market_cap": market_cap
+            }
+
+            # 다음 단계: opt10001 요청 (당일 데이터)
+            self.dynamicCall("SetInputValue(QString, QString)", "종목코드", code)
+            self.dynamicCall("CommRqData(QString, QString, int, QString)",
+                             "현재가요청", "opt10001", 0, "9001")
+            return
+
+        # ==========================================
+        # 2) opt10001 처리 (당일 데이터)
+        # ==========================================
         if rqname == "현재가요청":
             raw_code = self.dynamicCall(
                 "GetCommData(QString, QString, int, QString)",
@@ -268,37 +331,32 @@ class Kiwoom(QAxWidget):
                 trcode, rqname, 0, "현재가"
             )))
 
-            prev_close = abs(safe_float(self.dynamicCall(
-                "GetCommData(QString, QString, int, QString)",
-                trcode, rqname, 0, "전일가"
-            )))
-
             volume = safe_float(self.dynamicCall(
                 "GetCommData(QString, QString, int, QString)",
                 trcode, rqname, 0, "거래량"
             ))
 
-            amount = safe_float(self.dynamicCall(
+            amount = abs(safe_float(self.dynamicCall(
                 "GetCommData(QString, QString, int, QString)",
                 trcode, rqname, 0, "거래대금"
-            ))
-
-            shares = safe_float(self.dynamicCall(
-                "GetCommData(QString, QString, int, QString)",
-                trcode, rqname, 0, "상장주식"
-            ))
-
-            market_cap = safe_float(self.dynamicCall(
-                "GetCommData(QString, QString, int, QString)",
-                trcode, rqname, 0, "시가총액"
-            ))
+            )))
 
             market = self.market_map.get(code, "UNKNOWN")
             target_price = self.manager.target_cache.get(code, 0.0)
 
+            prev = self.temp_prev_data
+
             self.manager.update(
-                code, name, market, current, target_price,
-                prev_close, volume, amount, shares, market_cap
+                code,
+                name,
+                market,
+                current,
+                target_price,
+                prev["prev_close"],
+                volume,
+                amount,
+                prev["shares"],
+                prev["market_cap"]
             )
 
             self.tr_count += 1
