@@ -61,6 +61,9 @@ def to_eok(value):
 # Naver 목표가 크롤링
 ########################################################
 def get_naver_target_price_html(code: str) -> float:
+    """
+    네이버 금융 HTML에서 목표주가 가져오기 (간단 버전)
+    """
     url = f"https://finance.naver.com/item/main.naver?code={code}"
 
     headers = {
@@ -178,7 +181,7 @@ class NaverTargetThread(QThread):
 # Kiwoom API Wrapper
 ########################################################
 class Kiwoom(QAxWidget):
-    TR_INTERVAL = 700  # ms
+    TR_INTERVAL = 1200  # ms
 
     def __init__(self, manager: AnalysisManager, gui):
         super().__init__()
@@ -223,8 +226,7 @@ class Kiwoom(QAxWidget):
                 self.market_map[code] = "KOSPI" if code in kospi else "KOSDAQ"
 
         self.codes = filtered
-        self.tr_total = len(self.codes)
-        logger.info(f"필터링 후 종목 수: {self.tr_total}")
+        logger.info(f"필터링 후 종목 수: {len(self.codes)}")
 
         self.gui.label_status.setText("네이버 목표가 수집 중...")
         self.naver_thread = NaverTargetThread(self.manager, self.codes)
@@ -232,7 +234,18 @@ class Kiwoom(QAxWidget):
         self.naver_thread.start()
 
     def _on_naver_done(self):
-        logger.info("네이버 목표가 수집 완료. Kiwoom TR 시작.")
+        # 네이버 목표가가 있는 종목만 HTS에서 조사
+        before = len(self.codes)
+        self.codes = [c for c in self.codes if self.manager.target_cache.get(c, 0.0) > 0]
+        self.tr_total = len(self.codes)
+
+        logger.info(f"네이버 목표가 존재 종목 수: {self.tr_total} / 전체 {before}")
+        if self.tr_total == 0:
+            logger.info("목표가가 있는 종목이 없어 TR 수집을 종료합니다.")
+            self.gui.label_status.setText("목표가 데이터 없음 (네이버)")
+            self.gui.update_table()
+            return
+
         self.gui.label_status.setText("Kiwoom TR 수집 시작...")
 
         for code in self.codes:
@@ -393,7 +406,7 @@ class TargetPriceRankerGUI(QWidget):
             "순위", "시장", "종목코드", "종목명",
             "현재가", "목표가", "상승여력(%)",
             "전일종가", "거래량", "거래대금(백만원)",
-            "상장주식수(천주)", "시가총액(억원)"
+            "상장주식수(주)", "시가총액(억원)"
         ])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         layout.addWidget(self.table)
@@ -449,8 +462,7 @@ class TargetPriceRankerGUI(QWidget):
             amount_million = data['amount']
             self.table.setItem(i, 9, QTableWidgetItem(f"{amount_million:,.2f}"))
 
-            # 상장주식수(천주 단위로 보고 싶으면 /1000 해서 표시 가능하지만
-            # 여기서는 주 단위 그대로 표시
+            # 상장주식수(주)
             self.table.setItem(i, 10, QTableWidgetItem(f"{int(data['shares']):,}"))
 
             # 시가총액(억원)
