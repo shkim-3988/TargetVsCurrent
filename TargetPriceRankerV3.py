@@ -181,7 +181,7 @@ class NaverTargetThread(QThread):
 # Kiwoom API Wrapper
 ########################################################
 class Kiwoom(QAxWidget):
-    TR_INTERVAL = 1200  # ms
+    TR_INTERVAL = 700  # ms
 
     def __init__(self, manager: AnalysisManager, gui):
         super().__init__()
