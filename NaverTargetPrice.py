@@ -117,14 +117,25 @@ class NaverCrawlerThread(QThread):
 class KiwoomCodeLoader:
     def __init__(self, gui: QWidget):
         self.gui = gui
+        self.ocx = None
 
-        self.ocx = QAxWidget(gui)
-        self.ocx.setControl("KHOPENAPI.KHOpenAPICtrl.1")
-        gui.layout().addWidget(self.ocx)
-        self.ocx.setVisible(False)
+        try:
+            self.ocx = QAxWidget(gui)
+            if not self.ocx.setControl("KHOPENAPI.KHOpenAPICtrl.1"):
+                raise RuntimeError("KHOPENAPI.KHOpenAPICtrl.1 컨트롤을 초기화할 수 없습니다.")
 
-        self.ocx.OnEventConnect.connect(self._on_event_connect)
-        self.ocx.dynamicCall("CommConnect()")
+            if not hasattr(self.ocx, "OnEventConnect"):
+                raise RuntimeError("OpenAPI 컨트롤에서 OnEventConnect 이벤트를 찾을 수 없습니다.")
+
+            gui.layout().addWidget(self.ocx)
+            self.ocx.setVisible(False)
+            self.ocx.OnEventConnect.connect(self._on_event_connect)
+            self.ocx.dynamicCall("CommConnect()")
+
+        except Exception as e:
+            logger.error(f"키움 OpenAPI 초기화 실패: {e}")
+            self.gui.on_load_error(str(e))
+            self.ocx = None
 
     def _on_event_connect(self, err_code):
         if err_code == 0:
@@ -145,7 +156,10 @@ class KiwoomCodeLoader:
                 continue
 
             raw = self.ocx.dynamicCall("GetMasterCodeName(QString)", code)
-            name = raw.encode("latin1").decode("euc-kr")
+            if isinstance(raw, bytes):
+                name = raw.decode("euc-kr", errors="replace")
+            else:
+                name = str(raw)
 
             if not is_common_stock(code, name):
                 continue
@@ -214,6 +228,15 @@ class NaverTargetCrawlerGUI(QWidget):
 
         # ★ 자동으로 크롤링 시작
         QTimer.singleShot(500, self.start_crawling)
+
+    ####################################################
+    # OpenAPI 로드 실패 처리
+    ####################################################
+    def on_load_error(self, message: str):
+        self.label_status.setText("OpenAPI 초기화 실패")
+        self.progress.setMaximum(1)
+        self.progress.setValue(1)
+        QMessageBox.critical(self, "OpenAPI 오류", f"키움 OpenAPI 초기화 실패:\n{message}")
 
     ####################################################
     # 크롤링 시작

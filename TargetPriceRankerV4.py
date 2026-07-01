@@ -169,6 +169,12 @@ class Kiwoom(QAxWidget):
     # TR 응답 처리
     ####################################################
     def _on_receive_tr_data(self, screen_no, rqname, trcode, recordname, prev_next, *args):
+            # ★ rqname 인코딩 복원
+        try:
+            rqname = bytes(rqname, "latin1").decode("euc-kr")
+        except:
+            pass
+        
         print(f"[TR 수신] rqname={rqname}")
 
         if rqname == "기본정보요청":
